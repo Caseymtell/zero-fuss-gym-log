@@ -1,5 +1,8 @@
-import { ChangeEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { ReactNode, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
+import type { User } from "@supabase/supabase-js";
+import { supabase } from "./supabase";
+import { LoginScreen, useSession } from "./auth";
 
 /* ============================================================
    Types — unchanged from original
@@ -90,7 +93,8 @@ type ProgressPoint = {
    Constants & helpers — unchanged storage semantics
    ============================================================ */
 
-const STORAGE_KEY = "zero-fuss-gym-log-v1";
+// Data now lives in Supabase. Old localStorage key was "zero-fuss-gym-log-v1"
+// — kept here only as documentation in case we ever migrate forgotten data.
 
 const EXERCISES: Record<Category, string[]> = {
   upper: [
@@ -316,16 +320,165 @@ function seedData(): AppData {
   return { version: 1, templates: [push, lower, cardio], workouts: [] };
 }
 
-function loadData(): AppData {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return seedData();
-    const parsed = JSON.parse(raw) as AppData;
-    if (parsed.version !== 1) return seedData();
-    return parsed;
-  } catch {
-    return seedData();
+/* ============================================================
+   Supabase data layer
+   ============================================================ */
+
+type TemplateRow = {
+  id: string;
+  user_id: string;
+  name: string;
+  exercises: ExerciseEntry[];
+  created_at: string;
+  updated_at: string;
+};
+
+type WorkoutRow = {
+  id: string;
+  user_id: string;
+  date: string;
+  template_id: string | null;
+  name: string;
+  exercises: ExerciseEntry[];
+  complete: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+function templateFromRow(row: TemplateRow): WorkoutTemplate {
+  return {
+    id: row.id,
+    name: row.name,
+    exercises: (row.exercises ?? []) as ExerciseEntry[],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function workoutFromRow(row: WorkoutRow): ScheduledWorkout {
+  return {
+    id: row.id,
+    date: row.date,
+    templateId: row.template_id ?? undefined,
+    name: row.name,
+    exercises: (row.exercises ?? []) as ExerciseEntry[],
+    complete: row.complete,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function loadAllForUser(userId: string): Promise<AppData> {
+  const [templatesResult, workoutsResult] = await Promise.all([
+    supabase
+      .from("templates")
+      .select("*")
+      .order("created_at", { ascending: true }),
+    supabase
+      .from("workouts")
+      .select("*")
+      .order("created_at", { ascending: true }),
+  ]);
+
+  if (templatesResult.error) throw templatesResult.error;
+  if (workoutsResult.error) throw workoutsResult.error;
+
+  let templates = (templatesResult.data as TemplateRow[]).map(templateFromRow);
+  const workouts = (workoutsResult.data as WorkoutRow[]).map(workoutFromRow);
+
+  // First-run seed: brand-new user with no data gets the demo templates.
+  if (templates.length === 0 && workouts.length === 0) {
+    const seed = seedData();
+    const rows = seed.templates.map((template) => ({
+      id: template.id,
+      user_id: userId,
+      name: template.name,
+      exercises: template.exercises,
+      created_at: template.createdAt,
+      updated_at: template.updatedAt,
+    }));
+    const { data: inserted, error } = await supabase
+      .from("templates")
+      .insert(rows)
+      .select();
+    if (error) throw error;
+    templates = (inserted as TemplateRow[]).map(templateFromRow);
   }
+
+  return { version: 1, templates, workouts };
+}
+
+async function persistWorkoutInsert(workout: ScheduledWorkout, userId: string) {
+  const { error } = await supabase.from("workouts").insert({
+    id: workout.id,
+    user_id: userId,
+    date: workout.date,
+    template_id: workout.templateId ?? null,
+    name: workout.name,
+    exercises: workout.exercises,
+    complete: workout.complete ?? false,
+    created_at: workout.createdAt,
+    updated_at: workout.updatedAt,
+  });
+  if (error) throw error;
+}
+
+async function persistWorkoutUpdate(workout: ScheduledWorkout) {
+  const { error } = await supabase
+    .from("workouts")
+    .update({
+      date: workout.date,
+      template_id: workout.templateId ?? null,
+      name: workout.name,
+      exercises: workout.exercises,
+      complete: workout.complete ?? false,
+      updated_at: workout.updatedAt,
+    })
+    .eq("id", workout.id);
+  if (error) throw error;
+}
+
+async function persistWorkoutDelete(workoutId: string) {
+  const { error } = await supabase
+    .from("workouts")
+    .delete()
+    .eq("id", workoutId);
+  if (error) throw error;
+}
+
+async function persistTemplateUpsert(
+  template: WorkoutTemplate,
+  userId: string,
+) {
+  const { error } = await supabase.from("templates").upsert({
+    id: template.id,
+    user_id: userId,
+    name: template.name,
+    exercises: template.exercises,
+    created_at: template.createdAt,
+    updated_at: template.updatedAt,
+  });
+  if (error) throw error;
+}
+
+async function persistTemplateDelete(templateId: string) {
+  const { error } = await supabase
+    .from("templates")
+    .delete()
+    .eq("id", templateId);
+  if (error) throw error;
+}
+
+async function resetAllForUser(userId: string): Promise<AppData> {
+  await supabase.from("workouts").delete().eq("user_id", userId);
+  await supabase.from("templates").delete().eq("user_id", userId);
+  return loadAllForUser(userId);
+}
+
+function logSyncError(action: string, error: unknown) {
+  // Non-fatal — local state is already updated; we just lost the cloud write.
+  // Surfaced in console so it's debuggable without a flashy in-app error toast.
+  console.error(`[gym-log] Failed to ${action}`, error);
 }
 
 /* ============================================================
@@ -333,28 +486,122 @@ function loadData(): AppData {
    ============================================================ */
 
 function App() {
-  const [data, setData] = useState<AppData>(() => loadData());
+  const { session, loading } = useSession();
+  if (loading) return <LoadingScreen subtitle="Checking your session…" />;
+  if (!session) return <LoginScreen />;
+  return <AuthenticatedApp user={session.user} />;
+}
+
+function LoadingScreen({ subtitle }: { subtitle?: string }) {
+  return (
+    <div className="device-bg">
+      <div className="wallpaper" aria-hidden="true">
+        <div className="orb orb-a"></div>
+        <div className="orb orb-b"></div>
+        <div className="orb orb-c"></div>
+        <div className="orb orb-d"></div>
+        <div className="noise"></div>
+      </div>
+      <main className="app-scroll">
+        <header className="hero">
+          <p className="eyebrow">Loading</p>
+          <h1>Zero Fuss Gym Log</h1>
+          <p className="hero-sub">{subtitle ?? "Fetching your workouts…"}</p>
+        </header>
+      </main>
+    </div>
+  );
+}
+
+function AuthenticatedApp({ user }: { user: User }) {
+  const [data, setData] = useState<AppData | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [view, setView] = useState<View>("day");
   const [selectedDate, setSelectedDate] = useState(todayISO());
   const [addExerciseFor, setAddExerciseFor] = useState<string | null>(null);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  }, [data]);
+    let cancelled = false;
+    setData(null);
+    setLoadError(null);
+    loadAllForUser(user.id)
+      .then((loaded) => {
+        if (!cancelled) setData(loaded);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(err?.message ?? String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user.id]);
 
   const selectedWorkouts = useMemo(
     () =>
-      data.workouts
+      (data?.workouts ?? [])
         .filter((workout) => workout.date === selectedDate)
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
-    [data.workouts, selectedDate],
+    [data, selectedDate],
   );
 
-  function updateData(updater: (current: AppData) => AppData) {
-    setData((current) => updater(current));
+  async function signOut() {
+    await supabase.auth.signOut();
   }
 
+  async function resetAll() {
+    if (
+      !window.confirm(
+        "Reset everything? This wipes all your workouts and templates from the cloud and re-seeds the demo data. This can't be undone.",
+      )
+    ) {
+      return;
+    }
+    setData(null);
+    try {
+      const fresh = await resetAllForUser(user.id);
+      setData(fresh);
+    } catch (err) {
+      logSyncError("reset", err);
+      window.alert("Reset failed — see console for details.");
+      try {
+        const reloaded = await loadAllForUser(user.id);
+        setData(reloaded);
+      } catch {
+        // give up, user will see error screen
+      }
+    }
+  }
+
+  if (loadError) {
+    return (
+      <div className="device-bg">
+        <main className="app-scroll">
+          <header className="hero">
+            <p className="eyebrow">Something went wrong</p>
+            <h1>Couldn't load your data</h1>
+            <p className="hero-sub">{loadError}</p>
+          </header>
+          <button
+            className="btn primary full"
+            onClick={() => window.location.reload()}
+          >
+            Try again
+          </button>
+          <button
+            className="btn full"
+            style={{ marginTop: 10 }}
+            onClick={signOut}
+          >
+            Sign out
+          </button>
+        </main>
+      </div>
+    );
+  }
+  if (!data) return <LoadingScreen />;
+
   function scheduleTemplate(templateId: string) {
+    if (!data) return;
     const template = data.templates.find((item) => item.id === templateId);
     if (!template) return;
     const timestamp = now();
@@ -368,7 +615,12 @@ function App() {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
-    updateData((current) => ({ ...current, workouts: [...current.workouts, workout] }));
+    setData((current) =>
+      current ? { ...current, workouts: [...current.workouts, workout] } : current,
+    );
+    persistWorkoutInsert(workout, user.id).catch((err) =>
+      logSyncError("create workout from template", err),
+    );
   }
 
   function createBlankWorkout() {
@@ -382,59 +634,86 @@ function App() {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
-    updateData((current) => ({ ...current, workouts: [...current.workouts, workout] }));
+    setData((current) =>
+      current ? { ...current, workouts: [...current.workouts, workout] } : current,
+    );
+    persistWorkoutInsert(workout, user.id).catch((err) =>
+      logSyncError("create blank workout", err),
+    );
   }
 
-  function updateWorkout(workoutId: string, updater: (workout: ScheduledWorkout) => ScheduledWorkout) {
-    updateData((current) => ({
-      ...current,
-      workouts: current.workouts.map((workout) =>
-        workout.id === workoutId ? { ...updater(workout), updatedAt: now() } : workout,
-      ),
-    }));
+  function updateWorkout(
+    workoutId: string,
+    updater: (workout: ScheduledWorkout) => ScheduledWorkout,
+  ) {
+    if (!data) return;
+    const existing = data.workouts.find((w) => w.id === workoutId);
+    if (!existing) return;
+    const next: ScheduledWorkout = { ...updater(existing), updatedAt: now() };
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            workouts: current.workouts.map((w) =>
+              w.id === workoutId ? next : w,
+            ),
+          }
+        : current,
+    );
+    persistWorkoutUpdate(next).catch((err) =>
+      logSyncError("update workout", err),
+    );
   }
 
   function deleteWorkout(workoutId: string) {
-    updateData((current) => ({ ...current, workouts: current.workouts.filter((workout) => workout.id !== workoutId) }));
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            workouts: current.workouts.filter((w) => w.id !== workoutId),
+          }
+        : current,
+    );
+    persistWorkoutDelete(workoutId).catch((err) =>
+      logSyncError("delete workout", err),
+    );
   }
 
   function saveTemplate(template: WorkoutTemplate) {
-    updateData((current) => {
-      const exists = current.templates.some((item) => item.id === template.id);
+    if (!data) return;
+    const exists = data.templates.some((item) => item.id === template.id);
+    const next: WorkoutTemplate = exists
+      ? { ...template, updatedAt: now() }
+      : template;
+    setData((current) => {
+      if (!current) return current;
       if (exists) {
         return {
           ...current,
           templates: current.templates.map((item) =>
-            item.id === template.id ? { ...template, updatedAt: now() } : item,
+            item.id === template.id ? next : item,
           ),
         };
       }
-      return { ...current, templates: [...current.templates, template] };
+      return { ...current, templates: [...current.templates, next] };
     });
+    persistTemplateUpsert(next, user.id).catch((err) =>
+      logSyncError("save template", err),
+    );
   }
 
   function deleteTemplate(templateId: string) {
-    updateData((current) => ({
-      ...current,
-      templates: current.templates.filter((template) => template.id !== templateId),
-    }));
-  }
-
-  function importData(file: File) {
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(String(reader.result)) as AppData;
-        if (parsed.version !== 1 || !Array.isArray(parsed.templates) || !Array.isArray(parsed.workouts)) {
-          window.alert("That backup file does not look like a Zero Fuss Gym Log export.");
-          return;
-        }
-        setData(parsed);
-      } catch {
-        window.alert("Could not import that file.");
-      }
-    };
-    reader.readAsText(file);
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            templates: current.templates.filter((t) => t.id !== templateId),
+          }
+        : current,
+    );
+    persistTemplateDelete(templateId).catch((err) =>
+      logSyncError("delete template", err),
+    );
   }
 
   function addExerciseToWorkout(exercise: ExerciseEntry) {
@@ -471,10 +750,21 @@ function App() {
           />
         )}
         {view === "templates" && (
-          <TemplatesView templates={data.templates} saveTemplate={saveTemplate} deleteTemplate={deleteTemplate} />
+          <TemplatesView
+            templates={data.templates}
+            saveTemplate={saveTemplate}
+            deleteTemplate={deleteTemplate}
+          />
         )}
         {view === "progress" && <ProgressView workouts={data.workouts} />}
-        {view === "data" && <DataView data={data} setData={setData} importData={importData} />}
+        {view === "data" && (
+          <DataView
+            data={data}
+            userEmail={user.email ?? ""}
+            onReset={resetAll}
+            onSignOut={signOut}
+          />
+        )}
         <div className="bottom-pad"></div>
       </main>
 
@@ -1700,15 +1990,19 @@ function MiniChart({
 
 function DataView({
   data,
-  setData,
-  importData,
+  userEmail,
+  onReset,
+  onSignOut,
 }: {
   data: AppData;
-  setData: (data: AppData) => void;
-  importData: (file: File) => void;
+  userEmail: string;
+  onReset: () => void;
+  onSignOut: () => void;
 }) {
   function exportData() {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json",
+    });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -1717,24 +2011,14 @@ function DataView({
     URL.revokeObjectURL(url);
   }
 
-  function onImport(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (file) importData(file);
-    event.target.value = "";
-  }
-
-  function reset() {
-    if (window.confirm("Reset everything on this device? Export a backup first if you need it.")) {
-      setData(seedData());
-    }
-  }
-
   return (
     <>
       <header className="hero">
-        <p className="eyebrow">Local storage</p>
+        <p className="eyebrow">Cloud sync</p>
         <h1>Your data</h1>
-        <p className="hero-sub">Stays in this browser. Back it up before clearing.</p>
+        <p className="hero-sub">
+          Synced to Supabase. Signed in as <strong>{userEmail}</strong>.
+        </p>
       </header>
 
       <div className="glass summary-card">
@@ -1752,9 +2036,7 @@ function DataView({
           <div className="summary-headline">
             {data.templates.length} templates · {data.workouts.length} sessions
           </div>
-          <div className="summary-sub">
-            ≈ {Math.round(JSON.stringify(data).length / 1024)} KB on this device
-          </div>
+          <div className="summary-sub">Private to your account</div>
         </div>
       </div>
 
@@ -1770,26 +2052,24 @@ function DataView({
         </svg>
         Export backup (JSON)
       </button>
-      <label className="btn full file-label" style={{ marginTop: 10 }}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-          <path
-            d="M12 20V8m0 0l-5 5m5-5l5 5M5 4h14"
-            stroke="currentColor"
-            strokeWidth="2.2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-        Import backup
-        <input type="file" accept="application/json" onChange={onImport} />
-      </label>
-      <button className="btn full danger" style={{ marginTop: 10 }} onClick={reset}>
-        Reset demo data
+      <button
+        className="btn full"
+        style={{ marginTop: 10 }}
+        onClick={onSignOut}
+      >
+        Sign out
+      </button>
+      <button
+        className="btn full danger"
+        style={{ marginTop: 10 }}
+        onClick={onReset}
+      >
+        Reset to demo data
       </button>
 
       <div className="glass info-card">
-        <strong>Local-first PWA.</strong> Your data is saved in this browser only — no account, no sync.
-        Export before switching devices or clearing browser data.
+        <strong>Cloud-synced.</strong> Your data lives on Supabase, tied to
+        your email. Sign in on any device to see the same workouts.
       </div>
     </>
   );
